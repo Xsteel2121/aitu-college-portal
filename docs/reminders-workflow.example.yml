@@ -1,0 +1,59 @@
+name: AITU College reminders
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC; Asia/Almaty is UTC+5.
+    - cron: '0 3 * * 1-5'
+    - cron: '35 4 * * 1-5'
+    - cron: '45 4 * * 1-5'
+    - cron: '20 6 * * 1-5'
+    - cron: '40 6 * * 1-5'
+    - cron: '15 8 * * 1-5'
+    - cron: '30 9 * * 1-5'
+    - cron: '30 8 * * 1-5'
+    - cron: '0 10 * * 1-5'
+    - cron: '20 10 * * 1-5'
+    - cron: '50 11 * * 1-5'
+    - cron: '0 12 * * 1-5'
+    - cron: '30 13 * * 1-5'
+permissions: {}
+concurrency:
+  group: aitu-reminders
+  cancel-in-progress: false
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Process due reminders
+        shell: node {0}
+        run: |
+          const endpoint = 'https://aitu-campus-schedule.qejrjdjjd.chatgpt.site/api/jobs/run';
+          const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+          async function main() {
+            const deadline = Date.now() + 420000;
+            let failures = 0;
+            for (let batch = 0; batch < 150; batch++) {
+              if (Date.now() >= deadline) throw new Error('Reminder queue did not finish within seven minutes');
+              try {
+                const response = await fetch(endpoint, {
+                  method: 'POST', headers: {'Content-Type': 'application/json'},
+                  body: '{}', signal: AbortSignal.timeout(20000)
+                });
+                if (!response.ok) throw new Error('Reminder API returned HTTP ' + response.status);
+                const result = await response.json();
+                if (!result.configured) throw new Error('Push keys are not configured');
+                if (!result.pending) {
+                  console.log('Queue processed; sent:', result.sent || 0);
+                  return;
+                }
+                await wait(result.failed ? 60000 : 1000);
+              } catch (error) {
+                failures++;
+                if (failures >= 4) throw error;
+                await wait(30000);
+              }
+            }
+            throw new Error('Reminder queue exceeded the batch limit');
+          }
+          main().catch(error => { console.error(error.message); process.exitCode = 1; });

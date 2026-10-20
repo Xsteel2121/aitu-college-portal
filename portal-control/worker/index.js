@@ -1,0 +1,29 @@
+const defaults={retakeThreshold:70,scholarshipThreshold:70,enhancedThreshold:90,announcement:'',announcementUntil:''};
+const json=(data,status=200)=>Response.json(data,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
+function authorized(request,env){const a=request.headers.get('authorization')||'',b='Bearer '+(env.PORTAL_SERVICE_SECRET||'');if(!env.PORTAL_SERVICE_SECRET||a.length!==b.length)return false;let diff=0;for(let i=0;i<a.length;i++)diff|=a.charCodeAt(i)^b.charCodeAt(i);return diff===0;}
+function valid(s){return s&&[s.retakeThreshold,s.scholarshipThreshold,s.enhancedThreshold].every(n=>typeof n==='number'&&n>=1&&n<=100)&&s.enhancedThreshold>=s.scholarshipThreshold&&typeof s.announcement==='string'&&s.announcement.length<=1200&&typeof s.announcementUntil==='string'&&(!s.announcementUntil||/^\d{4}-\d{2}-\d{2}$/.test(s.announcementUntil));}
+async function body(r,limit=8000){if(Number(r.headers.get('content-length')||0)>limit)throw Error();const text=await r.text();if(text.length>limit)throw Error();return JSON.parse(text);}
+export default {async fetch(request,env){const url=new URL(request.url);try{if(url.pathname==='/'&&request.method==='GET')return new Response('AITU College · Portal configuration service',{headers:{'Content-Type':'text/plain; charset=utf-8'}});if(!env.BUCKET)return json({error:'Storage unavailable'},503);
+if(url.pathname==='/settings'&&request.method==='GET'){const object=await env.BUCKET.get('settings.json');return json({settings:object?await object.json():defaults});}
+if(!authorized(request,env))return json({error:'Unauthorized'},401);
+const match=/^\/(vault|locks|handoffs)\/([A-Za-z0-9_-]{43})(\/claim)?$/.exec(url.pathname);
+if(match){const [,kind,id,claim]=match,key=kind+'/'+id+'.json',current=await env.BUCKET.get(key),previous=current?await current.json():null,now=Date.now();
+ if(kind==='vault'){
+  if(request.method==='GET')return json({value:previous?.until>now?previous.value:null,etag:current?.etag||null});
+  if(request.method==='PUT'){const input=await body(request,32768);if(typeof input.value!=='string'||input.value.length>28000||!Number.isFinite(input.until)||input.until<now||input.until>now+8*86400000||input.etag!==null&&typeof input.etag!=='string')return json({error:'Invalid envelope'},400);const saved=await env.BUCKET.put(key,JSON.stringify({value:input.value,until:input.until}),{onlyIf:input.etag?{etagMatches:input.etag}:{etagDoesNotMatch:'*'}});return saved?json({ok:true}):json({error:'Conflict'},409);}
+ }
+ if(kind==='locks'){
+  const input=await body(request);if(typeof input.token!=='string'||input.token.length>100)return json({error:'Invalid lock'},400);
+  if(request.method==='POST'){if(previous?.until>now)return json({error:'Busy'},409);if(!Number.isFinite(input.until)||input.until<now||input.until>now+120000)return json({error:'Invalid expiry'},400);const saved=await env.BUCKET.put(key,JSON.stringify({token:input.token,until:input.until}),{onlyIf:current?{etagMatches:current.etag}:{etagDoesNotMatch:'*'}});return saved?json({ok:true}):json({error:'Busy'},409);}
+  if(request.method==='DELETE'){if(previous?.token!==input.token)return json({error:'Not owner'},409);const saved=await env.BUCKET.put(key,JSON.stringify({until:0}),{onlyIf:{etagMatches:current.etag}});return saved?json({ok:true}):json({error:'Conflict'},409);}
+ }
+ if(kind==='handoffs'){
+  if(request.method==='PUT'&&!claim){const input=await body(request,32768);if(typeof input.value!=='string'||input.value.length>28000||!Number.isFinite(input.until)||input.until<now||input.until>now+600000)return json({error:'Invalid handoff'},400);const saved=await env.BUCKET.put(key,JSON.stringify({value:input.value,until:input.until}),{onlyIf:{etagDoesNotMatch:'*'}});return saved?json({ok:true}):json({error:'Conflict'},409);}
+  if(request.method==='POST'&&claim){if(!previous?.value||previous.until<=now)return json({value:null});const saved=await env.BUCKET.put(key,JSON.stringify({until:previous.until,used:true}),{onlyIf:{etagMatches:current.etag}});return saved?json({value:previous.value}):json({value:null});}
+ }
+ return json({error:'Method not allowed'},405);
+}
+if(url.pathname==='/settings'&&request.method==='PUT'){const input=await body(request);if(!valid(input))return json({error:'Invalid settings'},400);const settings={retakeThreshold:input.retakeThreshold,scholarshipThreshold:input.scholarshipThreshold,enhancedThreshold:input.enhancedThreshold,announcement:input.announcement.trim(),announcementUntil:input.announcementUntil,updatedAt:new Date().toISOString()};await env.BUCKET.put('settings.json',JSON.stringify(settings));return json({settings});}
+if(url.pathname==='/metrics'&&request.method==='POST'){const input=await body(request);if(!['login','refresh'].includes(input.method)||typeof input.ok!=='boolean'||!Number.isFinite(input.duration))return json({error:'Invalid metric'},400);const date=new Date().toISOString().slice(0,10),key='metrics/'+date+'.json';for(let i=0;i<5;i++){const current=await env.BUCKET.get(key),m=current?await current.json():{date,success:0,failed:0,login:0,refresh:0,duration:0};m[input.ok?'success':'failed']++;m[input.method]++;m.duration+=Math.max(0,Math.min(120000,input.duration));const saved=await env.BUCKET.put(key,JSON.stringify(m),{onlyIf:current?{etagMatches:current.etag}:{etagDoesNotMatch:'*'}});if(saved)return json({ok:true});}return json({error:'Counter busy'},503);}
+if(url.pathname==='/metrics'&&request.method==='GET'){const now=Date.now(),days=await Promise.all(Array.from({length:14},async(_,i)=>{const date=new Date(now-i*86400000).toISOString().slice(0,10),o=await env.BUCKET.get('metrics/'+date+'.json');return o?o.json():{date,success:0,failed:0,login:0,refresh:0,duration:0};}));return json({days});}
+return json({error:'Not found'},404);}catch{return json({error:'Service unavailable'},503);}}};

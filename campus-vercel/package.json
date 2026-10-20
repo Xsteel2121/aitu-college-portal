@@ -1,0 +1,30 @@
+{
+  "name": "aitu-campus",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "prebuild": "node scripts/copy-pdf-assets.mjs",
+    "predev": "node scripts/copy-pdf-assets.mjs",
+    "test": "node scripts/verify-grades.cjs && node scripts/verify-portal.cjs && node scripts/verify-devices.cjs"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "lucide-react": "1.31.0",
+    "next": "16.3.8",
+    "pdfjs-dist": "^6.4.299",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "read-excel-file": "^6.0.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.1",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "tailwindcss": "^4.2.1",
+    "typescript": "5.9.3"
+  }
+}

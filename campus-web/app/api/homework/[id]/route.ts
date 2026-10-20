@@ -1,0 +1,8 @@
+import {actor,body,checkOrigin,db,json,unavailable} from '../../../../lib/server';
+import {moderator} from '../../../../lib/moderator';
+export async function PATCH(request:Request,{params}:{params:Promise<{id:string}>}){if(!checkOrigin(request))return json({error:'Недопустимый источник запроса'},403);try{const {id}=await params;const who=await actor(request);const row=await db().prepare('SELECT * FROM homework WHERE id=?').bind(id).first();if(!row)return json({error:'Задание не найдено'},404,who.cookie);const session=await moderator(request,String(row.group_id));const value=await body(request);const action=value.action||'close';
+ if(!session){if(action!=='close'||row.author_id!==who.id||row.status!=='pending')return json({error:'Это действие доступно только старосте этой группы'},403,who.cookie);await db().prepare("UPDATE homework SET done=1,done_at=? WHERE id=? AND author_id=? AND status='pending'").bind(Date.now(),id,who.id).run();return json({ok:true},200,who.cookie);}
+ if(!['approve','reject','close'].includes(action))return json({error:'Неизвестное действие'},400,who.cookie);
+ if(action==='approve'&&row.done)return json({error:'Задание уже закрыто'},409,who.cookie);
+ await db().batch([action==='approve'?db().prepare("UPDATE homework SET status='approved' WHERE id=? AND group_id=? AND done=0").bind(id,row.group_id):db().prepare('UPDATE homework SET done=1,done_at=?,status=? WHERE id=? AND group_id=?').bind(Date.now(),action==='reject'?'rejected':row.status,id,row.group_id),db().prepare('INSERT INTO moderation_log(id,homework_id,group_id,moderator_hash,action,created_at) VALUES (?,?,?,?,?,?)').bind(crypto.randomUUID(),id,row.group_id,session,action,Date.now())]);return json({ok:true},200,who.cookie);
+ }catch(e){return unavailable(e);}}

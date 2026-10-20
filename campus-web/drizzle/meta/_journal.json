@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1791219245477,
+      "tag": "0000_outgoing_maginty",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1791221264589,
+      "tag": "0001_motionless_mercury",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791370278820,
+      "tag": "0002_gigantic_whirlwind",
+      "breakpoints": true
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+node_modules/
+.next/
+.vercel/
+.env*
+!.env.example
+*.tsbuildinfo
+.DS_Store
+
+# Generated from the pinned pdfjs-dist dependency during dev/build.
+/public/pdf/
+.vercel
