@@ -1,0 +1,42 @@
+name: Publish reviewed source archive
+on:
+  push:
+    branches: [main]
+    paths: [source.tar.gz]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: initial-source-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify reviewed archive
+        run: |
+          echo '33e35cc03b1778409f56098992b1d60ea37d0157c75e0da6c06c97576b1a5554  source.tar.gz' | sha256sum --check
+          python3 - <<'PYTHON'
+          import tarfile
+          from pathlib import PurePosixPath
+          with tarfile.open('source.tar.gz') as archive:
+              for entry in archive.getmembers():
+                  path = PurePosixPath(entry.name)
+                  if path.is_absolute() or '..' in path.parts or not entry.isfile() or path.parts[0] == '.github':
+                      raise SystemExit('Unexpected archive entry')
+          PYTHON
+      - name: Publish source tree
+        run: |
+          tar -xzf source.tar.gz --no-same-owner
+          git rm -- source.tar.gz
+          git add .
+          python3 scripts/check-source.py
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Publish portal source and security documentation'
+          git push origin HEAD:main
