@@ -1,7 +1,7 @@
 import {brokerLogin,brokerRefresh,brokerStatus,createDeviceCode,claimDeviceCode} from '../../../lib/smartnation-broker.server';
 import {after} from 'next/server';
 import {recordSync} from '../../../lib/portal.server';
-import {clearSessionCookie,hasSmartNationSession,sessionCookie,SyncError} from '../../../lib/smartnation.server';
+import {clearSessionCookie,hasSmartNationSession,sessionCookie,SyncError,syncFailure} from '../../../lib/smartnation.server';
 export const runtime='nodejs';
 export const dynamic='force-dynamic';
 export const maxDuration=120;
@@ -25,7 +25,7 @@ async function synchronize(request:Request,login:boolean){
       result=await brokerLogin(input.login.trim(),input.password,input.remember===true);
     }else result=await brokerRefresh(request);
     return response({snapshot:result.snapshot},200,sessionCookie(result.session,secure));
-  }catch(error){const known=error instanceof SyncError;let cookie:string[]|undefined;if(known&&error.status===401&&(!login||!hasSmartNationSession(request)))cookie=clearSessionCookie(secure);else if(known&&error.session){try{cookie=sessionCookie(error.session,secure);}catch{}}return response({error:known?error.message:'Не удалось синхронизировать оценки. Попробуйте быстрый импорт.',needsReconnect:known&&error.status===409,hasSession:Boolean(known&&error.session&&cookie||login&&hasSmartNationSession(request)),canRetry:Boolean(known&&error.session&&cookie&&error.status!==409)},known?error.status:502,cookie);}
+  }catch(cause){const error=syncFailure(cause,login?'login-broker':'refresh-broker'),known=true;console.error('smartnation-sync-failed',JSON.stringify({operation:login?'login':'refresh',status:error.status,code:error.code,stage:error.stage}));let cookie:string[]|undefined;if(known&&error.status===401&&(!login||!hasSmartNationSession(request)))cookie=clearSessionCookie(secure);else if(known&&error.session){try{cookie=sessionCookie(error.session,secure);}catch{}}return response({error:known?error.message:'Не удалось синхронизировать оценки. Попробуйте быстрый импорт.',needsReconnect:known&&error.status===409,hasSession:Boolean(known&&error.session&&cookie||login&&hasSmartNationSession(request)),canRetry:Boolean(known&&error.session&&cookie&&error.status!==409)},known?error.status:502,cookie);}
 }
 export async function POST(request:Request){const started=Date.now(),result=await synchronize(request,true);after(()=>recordSync('login',result.ok,Date.now()-started));return result;}
 export async function PATCH(request:Request){const started=Date.now(),result=await synchronize(request,false);after(()=>recordSync('refresh',result.ok,Date.now()-started));return result;}
