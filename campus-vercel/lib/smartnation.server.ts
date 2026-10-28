@@ -117,8 +117,8 @@ export function parseJournalListData(payload:Record<string,unknown>,base:string)
   return {journals,home:'',next};
 }
 export function parseJournalPayload(payload:Record<string,unknown>,students:Record<string,unknown>,name:string,teacher:string,id:string):GradeSubject {
-  if(payload.isStudent!==true)throw new SyncError('Подключение доступно для личного кабинета студента. Используйте индивидуальную выгрузку.',403);
-  const people=students.students;if(!Array.isArray(people)||people.length!==1)throw new SyncError('Не удалось однозначно выбрать личные оценки. Используйте быстрый импорт.');
+  if(payload.isStudent!==true)throw new SyncError('Подключение доступно для личного кабинета студента. Используйте индивидуальную выгрузку.',403,'not-personal-journal');
+  const people=students.students;if(!Array.isArray(people)||people.length!==1)throw new SyncError('Не удалось однозначно выбрать личные оценки. Используйте быстрый импорт.',403,'ambiguous-student');
   const person=people[0] as Record<string,unknown>,days=payload.days;
   if(!Array.isArray(days))throw new SyncError('Формат журнала изменился. Используйте быстрый импорт.');
   const grades:{value:number|null;absence?:true;date?:string;kind?:string;sourceId:string}[]=[];
@@ -133,7 +133,7 @@ export function parseJournalPayload(payload:Record<string,unknown>,students:Reco
     grades.push({value,...(absence?{absence:true as const}:{}),date:dateValue(day.date??day.fullDate??day.label),kind:typeof point.type_label==='string'?point.type_label:typeof day.type_label==='string'?day.type_label:typeof point.type==='string'?point.type:typeof day.type==='string'?day.type:undefined,sourceId:String(day.id??day.date??day.label??grades.length)});
   }
   try{
-    const subject=parseGradeJSON([{name,teacher,scale:payload.typeOfEvaluation==='percent'?100:payload.typeOfEvaluation==='five'?5:undefined,grades}]).subjects[0];
+    const subject=parseGradeJSON([{name,teacher,scale:payload.typeOfEvaluation==='percent'?100:5,grades}]).subjects[0];
     return {...subject,id,grades:subject.grades.map((g,i)=>({...g,id:id+':'+grades[i].sourceId,kind:grades[i].kind}))};
   }catch(error){throw syncFailure(error,'journal-parse');}
 }
@@ -157,7 +157,7 @@ async function syncJournals(client:SmartNationClient):Promise<GradeSnapshot>{
     if(!found||!parsed.next)break;address=parsed.next;
   }
   if(!journals.size)throw new SyncError('Журналы не найдены. Проверьте кабинет или используйте быстрый импорт.');
-  const subjects:GradeSubject[]=[],warnings:string[]=[],unavailableSubjectIds:string[]=[];
+  const subjects:GradeSubject[]=[],warnings:string[]=[],unavailableSubjectIds:string[]=[];let firstFailure:SyncError|undefined;
   // Small parallel batches keep the UI responsive without flooding the college portal.
   const list=[...journals.values()];
   for(let offset=0;offset<list.length;offset+=3){const batch=await Promise.allSettled(list.slice(offset,offset+3).map(async journal=>{
@@ -175,16 +175,16 @@ async function syncJournals(client:SmartNationClient):Promise<GradeSnapshot>{
   }));
     for(let i=0;i<batch.length;i++){
       const result=batch[i];if(result.status==='fulfilled')subjects.push(result.value);
-      else {const error=syncFailure(result.reason,'journal-read');if(error.status===401||error.status===403)throw error;
+      else {const error=syncFailure(result.reason,'journal-read');if(error.status===401)throw error;firstFailure||=error;
         console.warn('smartnation-journal-failed',JSON.stringify({code:error.code,status:error.status,stage:error.stage}));
         const missingId=new URL(list[offset+i].url).pathname.match(/\/journals\/(\d+)/)?.[1];if(missingId)unavailableSubjectIds.push('smartnation-'+missingId);
-        warnings.push(`Не удалось обновить предмет «${list[offset+i].name||'Журнал'}». Повторите синхронизацию.`);
+        warnings.push(error.status===403?`Для предмета «${list[offset+i].name||'Журнал'}» недоступен личный журнал студента. Он не загружен.`:`Не удалось обновить предмет «${list[offset+i].name||'Журнал'}». Повторите синхронизацию.`);
       }
     }
   }
-  if(!subjects.length)throw new SyncError('SmartNation не вернул журналы с оценками. Повторите загрузку журналов.',502,'all-journals-failed');
+  if(!subjects.length)throw firstFailure||new SyncError('SmartNation не вернул журналы с оценками. Повторите загрузку журналов.',502,'all-journals-failed');
   if(!subjects.some(s=>s.grades.length))warnings.push('Журналы найдены, но оценок и пропусков пока нет.');
-  return {version:1,source:'smartnation',profile:client.profile,syncedAt:new Date().toISOString(),subjects,warnings,...(unavailableSubjectIds.length?{unavailableSubjectIds}:{})};
+  return {version:1,source:'smartnation',accountKey:smartNationOwner(client.session),profile:client.profile,syncedAt:new Date().toISOString(),subjects,warnings,...(unavailableSubjectIds.length?{unavailableSubjectIds}:{})};
 }
 export async function loginAndSync(login:string,password:string,remember:boolean,fetcher:typeof fetch=fetch){
   const session:UpstreamSession={cookies:{},expires:Date.now()+(remember?7*86400000:8*3600000),remember};secret();
