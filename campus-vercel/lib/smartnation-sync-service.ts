@@ -3,8 +3,11 @@ import {parseGradeJSON,parseGradeRows,parseGradeText,type ScaleChoice} from './g
 export {loadGradeCache,saveGradeCache,clearGradeCache} from './grade-cache';
 export class SmartNationRequestError extends Error{constructor(message:string,public canRetry=false,public status=0,public needsReconnect=false,public hasSession=false){super(message);}}
 async function syncRequest(method:string,body?:unknown):Promise<GradeSnapshot>{
-  const response=await fetch('/api/smartnation',{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store',signal:AbortSignal.timeout(90000)});
-  const data=await response.json();if(!response.ok)throw new SmartNationRequestError(data.error||'Синхронизация недоступна. Попробуйте быстрый импорт.',data.canRetry===true,response.status,data.needsReconnect===true,data.hasSession===true);
+  let response:Response;
+  try{response=await fetch('/api/smartnation',{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store',signal:AbortSignal.timeout(115000)});}
+  catch{throw new SmartNationRequestError('Не удалось дождаться ответа сервера. Сохранённые оценки доступны; проверьте соединение и повторите загрузку.',false,504);}
+  let data;try{data=await response.json();}catch{throw new SmartNationRequestError('Сервер временно не смог загрузить журнал. Сохранённые оценки доступны; повторите попытку.',false,response.status);}
+  if(!response.ok)throw new SmartNationRequestError(data.error||'Синхронизация недоступна. Попробуйте быстрый импорт.',data.canRetry===true,response.status,data.needsReconnect===true,data.hasSession===true);
   if(!validSnapshot(data.snapshot))throw new Error('SmartNation вернул неизвестный формат. Используйте быстрый импорт.');
   return data.snapshot;
 }

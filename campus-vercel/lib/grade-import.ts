@@ -1,11 +1,14 @@
-import type {Grade,GradeScale,GradeSnapshot,GradeSubject} from './grades';
+import type {GradeScale,GradeSnapshot,GradeSubject} from './grades';
 export type ScaleChoice = GradeScale|'auto';
 const clean=(value:unknown)=>String(value??'').replace(/\u00a0/g,' ').trim();
 const datePattern=/\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)\b/g;
 const ignore=/^(?:средн(?:ий|ее)|итог|GPA|балл|оценк|предмет|дисциплина|преподаватель|дата|период|семестр|название|количество|отведено|тип|модул|группа|операции|copyright|контакт|пароль|логин|ИИН|запомнить|номер|№|учебный год|страниц|всего)/i;
-function numbers(text:string,decimalComma=false) {
+type RawMark={value:number;absence?:false;date?:string}|{value:null;absence:true;date?:string};
+export function absenceMarker(value:unknown){return typeof value==='string'&&/^(?:н(?:\/б|б)?|absent)$/i.test(value.trim());}
+function parseMarks(text:string,decimalComma=false):RawMark[] {
   const normalized=decimalComma&&/^\s*\d{1,3},\d{1,2}\s*$/.test(text)?text.replace(',','.'):text.replace(/,/g,' ');
-  return (normalized.replace(/\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[./]\d{1,2}[./]\d{2,4})\b/g,' ').match(/(?<![\p{L}\d])(?:100|\d{1,2})(?:\.\d{1,2})?(?![\p{L}\d])/gu)||[]).map(Number).filter(v=>Number.isFinite(v)&&v>=0&&v<=100);
+  const tokens=normalized.replace(/\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[./]\d{1,2}[./]\d{2,4})\b/g,' ').match(/(?<![\p{L}\d/])(?:н\/б|нб|н|absent|(?:100|\d{1,2})(?:\.\d{1,2})?)(?![\p{L}\d/])/giu)||[];
+  return tokens.map(token=>absenceMarker(token)?{value:null,absence:true} as const:{value:Number(token)}).filter(g=>g.value===null||Number.isFinite(g.value)&&g.value>=0&&g.value<=100);
 }
 function infer(values:number[],choice:ScaleChoice):GradeScale {return choice==='auto'?(values.length>0&&values.every(v=>Number.isInteger(v)&&v>=2&&v<=5)?5:100):choice;}
 export function dateValue(input:unknown):string|undefined {
@@ -22,9 +25,9 @@ function finish(subjects:GradeSubject[],warnings:string[]=[]):GradeSnapshot {
   if(!subjects.some(s=>s.grades.length))warnings.push('Найдены названия предметов, но нет числовых оценок. Откройте сам журнал, а не список журналов.');
   return {version:1,source:'import',syncedAt:new Date().toISOString(),subjects,warnings};
 }
-function makeSubject(name:string,teacher:string,raw:{value:number;date?:string}[],choice:ScaleChoice,index:number):GradeSubject {
-  const scale=infer(raw.map(g=>g.value),choice);
-  if(raw.some(g=>g.value<(scale===5?2:0)||g.value>scale))throw new Error(`«${name}»: оценки не соответствуют выбранной шкале ${scale}.`);
+function makeSubject(name:string,teacher:string,raw:RawMark[],choice:ScaleChoice,index:number):GradeSubject {
+  const scale=infer(raw.flatMap(g=>g.value===null?[]:[g.value]),choice);
+  if(raw.some(g=>g.value!==null&&(g.value<(scale===5?2:0)||g.value>scale)))throw new Error(`«${name}»: оценки не соответствуют выбранной шкале ${scale}.`);
   if(raw.length>500)throw new Error(`«${name}»: больше 500 оценок. Разделите выгрузку по семестрам.`);
   return {id:`import-${index}`,name:name.slice(0,250),teacher:teacher.slice(0,250),scale,grades:raw.map((g,j)=>({id:`import-${index}-${j}`,...g}))};
 }
@@ -45,7 +48,7 @@ export function parseGradeRows(rows:unknown[][],choice:ScaleChoice='auto'):Grade
   const dateIndex=header.findIndex(c=>/^(дата|date|күні)$/i.test(c));
   const valueIndex=header.findIndex(c=>/^(оценк[аи]|балл[ы]?|grade[s]?|mark[s]?|score[s]?|баға)$/i.test(c));
   const scaleIndex=header.findIndex(c=>/^(scale|шкала)$/i.test(c));
-  const items=new Map<string,{name:string;teacher:string;values:{value:number;date?:string}[];scale:ScaleChoice}>();
+  const items=new Map<string,{name:string;teacher:string;values:RawMark[];scale:ScaleChoice}>();
   for(const row of rows.slice(headerIndex>=0?headerIndex+1:0)){
     const name=clean(row[nameIndex>=0?nameIndex:0]);if(!name||ignore.test(name)||!/[\p{L}]/u.test(name))continue;
     const teacher=teacherIndex>=0?clean(row[teacherIndex]):'';
@@ -53,7 +56,7 @@ export function parseGradeRows(rows:unknown[][],choice:ScaleChoice='auto'):Grade
     const forcedScale=scaleIndex>=0&&[5,100].includes(Number(row[scaleIndex]))?Number(row[scaleIndex]) as GradeScale:choice;
     const current=items.get(key)||{name,teacher,values:[],scale:forcedScale};
     const gradeCells=valueIndex>=0?[{value:row[valueIndex],index:valueIndex}]:row.map((value,index)=>({value,index})).filter(c=>c.index>(nameIndex>=0?nameIndex:0)&&c.index!==teacherIndex&&c.index!==dateIndex&&c.index!==scaleIndex&&(!header.length||dateValue(header[c.index])||/^оценк|grade|балл/i.test(header[c.index]||'')));
-    for(const cell of gradeCells){const text=clean(cell.value);if(!text||cell.value instanceof Date||/^\d{4}-\d{2}-\d{2}$|^\d{1,2}[./]\d{1,2}[./]\d{2,4}$/.test(text))continue;for(const value of numbers(text,true))current.values.push({value,date:dateIndex>=0?dateValue(row[dateIndex]):dateValue(header[cell.index])});}
+    for(const cell of gradeCells){const text=clean(cell.value);if(!text||cell.value instanceof Date||/^\d{4}-\d{2}-\d{2}$|^\d{1,2}[./]\d{1,2}[./]\d{2,4}$/.test(text))continue;for(const mark of parseMarks(text,true))current.values.push({...mark,date:dateIndex>=0?dateValue(row[dateIndex]):dateValue(header[cell.index])});}
     items.set(key,current);
   }
   return finish([...items.values()].map((item,i)=>makeSubject(item.name,item.teacher,item.values,item.scale,i)));
@@ -68,7 +71,14 @@ export function parseGradeJSON(value:unknown,choice:ScaleChoice='auto'):GradeSna
     if(!name)throw new Error('В JSON у предмета нет названия.');
     const scale=Number(row.scale??root?.scale),raw=row.grades??row.marks??row.scores??[];
     if(!Array.isArray(raw))throw new Error(`«${name}»: grades должен быть массивом.`);
-    const grades:Omit<Grade,'id'>[]=raw.flatMap(item=>{const data:Record<string,unknown>=item&&typeof item==='object'?item as Record<string,unknown>:{value:item};const v=data.value??data.grade??data.score;if(v===null||v===''||v===undefined||/^(н|нб|н\/а|absent|н\/б|—|-)$/i.test(String(v)))return [];const n=Number(String(v).replace(',','.'));if(!Number.isFinite(n)||n<0||n>100)throw new Error(`«${name}»: некорректная оценка.`);return [{value:n,date:dateValue(data.date)}];});
+    const grades:RawMark[]=raw.flatMap<RawMark>(item=>{
+      const data:Record<string,unknown>=item&&typeof item==='object'?item as Record<string,unknown>:{value:item};
+      const v=data.value??data.grade??data.score,date=dateValue(data.date);
+      if(data.absence===true||data.absented===true||absenceMarker(v))return [{value:null,absence:true,date}];
+      if(v===null||v===''||v===undefined||/^(н\/а|n\/a|—|-)$/i.test(String(v)))return [];
+      const n=Number(String(v).replace(',','.'));if(!Number.isFinite(n)||n<0||n>100)throw new Error(`«${name}»: некорректная оценка.`);
+      return [{value:n,date}];
+    });
     return makeSubject(name,clean(row.teacher??row.teacherName),grades,[5,100].includes(scale)?scale as GradeScale:choice,index);
   });
   return finish(subjects);
@@ -84,7 +94,7 @@ export function parseGradeText(text:string,choice:ScaleChoice='auto'):GradeSnaps
     const section=text.slice(text.search(/(?:^|\n)\s*(?:№\s*)?Дата(?:\s|$)/i));
     if(!/(?:^|\n)\s*(?:№\s*)?Дата(?:\s|$)/i.test(text))return finish([makeSubject(name,teacher,[],choice,0)],['В скопированном тексте нет таблицы оценок.']);
     const end=section.search(/Типы оценок|Smartnation College|Пользовательское соглашение|ИНСТРУКЦИИ|ТОО «Bilim|Контакты:/i);const marks=(end>=0?section.slice(0,end):section).replace(/(?:^|\n)\s*\d+\s*Оценка\s*/i,'\n').replace(datePattern,' ');
-    return finish([makeSubject(name,teacher,numbers(marks).map(value=>({value})),/Процентная система/.test(text)?100:choice,0)],['Импортирован открытый журнал и выбранный в нём месяц. Для всех месяцев выберите «Все месяцы» перед копированием.']);
+    return finish([makeSubject(name,teacher,parseMarks(marks),/Процентная система/.test(text)?100:choice,0)],['Импортирован открытый журнал и выбранный в нём месяц. Для всех месяцев выберите «Все месяцы» перед копированием.']);
   }
   if(text.includes('\t')||/^(?:предмет|subject|дисциплина)[;,]/im.test(text))return parseGradeRows(parseDelimited(text),choice);
   const subjects:GradeSubject[]=[];let pendingName='',teacher='';
@@ -93,8 +103,8 @@ export function parseGradeText(text:string,choice:ScaleChoice='auto'):GradeSnaps
     if(/^(?:преподаватель|teacher)\s*:/i.test(line)){teacher=line.replace(/^[^:]+:\s*/,'');continue;}
     if(ignore.test(line))continue;
     const match=line.match(/^([\p{L}][\p{L}\d\s'"«»()&.,/-]{1,200}?)\s*(?::|\s[—–-]\s|\s{2,})\s*((?:\d|[нН—-]).*)$/u);
-    if(match){const vals=numbers(match[2]);if(vals.length)subjects.push(makeSubject(match[1].trim(),teacher,vals.map(value=>({value})),choice,subjects.length));pendingName='';teacher='';continue;}
-    if(/^[\d\s,;|.\tнНбБ/—-]+$/.test(line)&&pendingName){const vals=numbers(line);if(vals.length)subjects.push(makeSubject(pendingName,teacher,vals.map(value=>({value})),choice,subjects.length));pendingName='';teacher='';}
+    if(match){const vals=parseMarks(match[2]);if(vals.length)subjects.push(makeSubject(match[1].trim(),teacher,vals,choice,subjects.length));pendingName='';teacher='';continue;}
+    if(/^[\d\s,;|.\tнНбБ/—-]+$/.test(line)&&pendingName){const vals=parseMarks(line);if(vals.length)subjects.push(makeSubject(pendingName,teacher,vals,choice,subjects.length));pendingName='';teacher='';}
     else if(/[\p{L}]/u.test(line)&&line.length<=250&&!/https?:|@|^\+7|Smartnation|Вход|Главная|Служба поддержки/i.test(line))pendingName=line;
   }
   return finish(subjects);

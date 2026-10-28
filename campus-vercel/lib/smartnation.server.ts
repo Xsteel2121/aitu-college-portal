@@ -1,12 +1,18 @@
 import {createCipheriv,createDecipheriv,createHash,createHmac,randomBytes} from 'node:crypto';
 import {load} from 'cheerio';
-import {parseGradeJSON,parseGradeText,dateValue} from './grade-import';
+import {parseGradeJSON,parseGradeText,dateValue,absenceMarker} from './grade-import';
 import type {GradeSnapshot,GradeSubject,StudentProfile} from './grades';
 const ORIGIN='https://college.smartnation.kz';
 export const SMARTNATION_LOGIN=ORIGIN+'/ru/mng/login';
 export const SMARTNATION_JOURNALS=ORIGIN+'/ru/mng/control/journals';
 const COOKIE='aitu-smartnation';
-export class SyncError extends Error{session?:UpstreamSession;constructor(message:string,public status=502){super(message);}}
+export class SyncError extends Error{session?:UpstreamSession;stage?:string;constructor(message:string,public status=502,public code='upstream-response'){super(message);}}
+export function syncFailure(error:unknown,stage:string):SyncError {
+  if(error instanceof SyncError){error.stage||=stage;return error;}
+  const kind=error instanceof Error?error.name:'Unknown';
+  console.error('smartnation-unexpected',JSON.stringify({stage,kind:/^[A-Za-z]+Error$/.test(kind)?kind:'Error'}));
+  const wrapped=new SyncError('Не удалось обработать ответ SmartNation. Сохранённые оценки доступны. Повторите загрузку журналов.',502,'response-format');wrapped.stage=stage;return wrapped;
+}
 export interface UpstreamSession {needsReconnect?:boolean;owner?:string;vault?:{owner:string;epoch:string};cookies:Record<string,string>;token?:string;expires:number;remember:boolean;csrf?:string;journalsURL?:string;context?:Record<string,string>;}
 function secret(){const value=process.env.SMARTNATION_SESSION_SECRET;if(!value||value.length<32)throw new SyncError('Прямой вход пока не настроен. Оценки можно загрузить через «Быстрый импорт».',503);return createHash('sha256').update('aitu-smartnation-session-v1:'+value).digest();}
 export function sessionCookie(session:UpstreamSession,secure:boolean){
@@ -43,21 +49,33 @@ class SmartNationClient {
   profile:StudentProfile={};
   private accessToken?:string;
   private renewing?:Promise<void>;
+  private deadline=Date.now()+100000;
   constructor(public session:UpstreamSession,private fetcher:typeof fetch=fetch){}
-  async request(path:string,options:RequestInit={},hop=0):Promise<{html:string;url:string;status:number;json?:Record<string,unknown>}> {
+  async request(path:string,options:RequestInit={},hop=0,retry=0):Promise<{html:string;url:string;status:number;json?:Record<string,unknown>}> {
     if(hop>4)throw new SyncError('SmartNation возвращает слишком много перенаправлений.');
+    if(Date.now()>=this.deadline)throw new SyncError('SmartNation отвечает слишком долго. Сохранённые оценки доступны; повторите загрузку.',504,'sync-deadline');
     const url=safeURL(path),headers=new Headers(options.headers);
+    const stage=(!options.method||options.method==='GET')?'read':url.pathname.endsWith('/login')?'login':'token';
     headers.set('Cookie',Object.entries(this.session.cookies).map(([key,value])=>`${key}=${value}`).join('; '));headers.set('Accept-Language','ru');headers.set('User-Agent','AITU-College-Grade-Sync/1.0');
     for(const [key,value]of Object.entries(this.session.context||{}))headers.set(key,value);
     if(this.accessToken||this.session.token)headers.set('Authorization','Bearer '+(this.accessToken||this.session.token));
     if(options.method&&options.method!=='GET'){headers.set('Origin',ORIGIN);headers.set('Referer',SMARTNATION_LOGIN);if(this.session.csrf)headers.set('X-CSRF-TOKEN',this.session.csrf);}
-    let response:Response;
-    try{response=await this.fetcher(url,{...options,headers,redirect:'manual',cache:'no-store',signal:AbortSignal.timeout(15000)});}catch{throw new SyncError('SmartNation не ответил. Ваши оценки сохранены; доступен быстрый импорт.',504);}
+    let response:Response,html:string;
+    try{
+      response=await this.fetcher(url,{...options,headers,redirect:'manual',cache:'no-store',signal:AbortSignal.timeout(Math.min(20000,this.deadline-Date.now()))});
+      if(Number(response.headers.get('content-length')||0)>4000000)throw new SyncError('Журнал слишком большой. Импортируйте выгрузку за семестр.');
+      html=await response.text();
+    }catch(error){
+      if(error instanceof SyncError)throw error;
+      if(stage==='read'&&retry===0&&this.deadline-Date.now()>22000)return this.request(path,options,hop,1);
+      const failure=new SyncError('SmartNation не ответил вовремя. Ваши оценки сохранены; повторите загрузку журналов.',504,'upstream-timeout');failure.stage=stage;throw failure;
+    }
+    if(response.status>=500&&stage==='read'&&retry===0&&this.deadline-Date.now()>22000)return this.request(path,options,hop,1);
     for(const cookie of response.headers.getSetCookie()){const pair=cookie.split(';')[0],index=pair.indexOf('=');if(index>0)this.session.cookies[pair.slice(0,index)]=pair.slice(index+1);}
     if(response.status>=300&&response.status<400){const location=response.headers.get('location');if(!location)throw new SyncError('Неизвестный ответ SmartNation.');return this.request(safeURL(new URL(location,url).href).href,{},hop+1);}
     if(response.status===403||response.status===429)throw new SyncError('SmartNation ограничил прямое подключение. Откройте кабинет и используйте «Быстрый импорт».',response.status===429?429:502);
     if(Number(response.headers.get('content-length')||0)>4000000)throw new SyncError('Журнал слишком большой. Импортируйте выгрузку за семестр.');
-    const html=await response.text();if(html.length>4000000)throw new SyncError('Слишком большой ответ SmartNation.');
+    if(html.length>4000000)throw new SyncError('Слишком большой ответ SmartNation.');
     const config=coreConfiguration(html);this.profile={...this.profile,...parseStudentProfile(config)};if(typeof config.csrfToken==='string')this.session.csrf=config.csrfToken;
     for(const [key,header]of Object.entries({organizationId:'X-Organization-Id',roleKey:'X-Role-Key',locality:'X-LocalityId',department:'X-DepartmentId',region:'X-RegionId'})){const value=config[key];if(value&&(typeof value==='string'||typeof value==='number')&&String(value).length<=120&&!/[\r\n]/.test(String(value))){this.session.context||={};this.session.context[header]=String(value);}}
     let json:Record<string,unknown>|undefined;try{const result=JSON.parse(html);if(result&&typeof result==='object')json=result;}catch{}
@@ -103,12 +121,21 @@ export function parseJournalPayload(payload:Record<string,unknown>,students:Reco
   const people=students.students;if(!Array.isArray(people)||people.length!==1)throw new SyncError('Не удалось однозначно выбрать личные оценки. Используйте быстрый импорт.');
   const person=people[0] as Record<string,unknown>,days=payload.days;
   if(!Array.isArray(days))throw new SyncError('Формат журнала изменился. Используйте быстрый импорт.');
-  const grades:{value:number;date?:string;kind?:string;sourceId:string}[]=[];
-  for(const raw of days){const day=raw as Record<string,unknown>;const points=(day.points||{}) as Record<string,unknown>;const entry=points[String(person.id)];const point=entry&&typeof entry==='object'?entry as Record<string,unknown>:null;
-    if(!point||point.absented||point.point===null||point.point===''||point.point===undefined)continue;
-    const value=Number(point.point);if(!Number.isFinite(value))continue;grades.push({value,date:dateValue(day.date??day.fullDate??day.label),kind:typeof point.type_label==='string'?point.type_label:typeof day.type_label==='string'?day.type_label:typeof point.type==='string'?point.type:typeof day.type==='string'?day.type:undefined,sourceId:String(day.id??day.date??day.label??grades.length)});
+  const grades:{value:number|null;absence?:true;date?:string;kind?:string;sourceId:string}[]=[];
+  for(const raw of days){
+    if(!raw||typeof raw!=='object')continue;
+    const day=raw as Record<string,unknown>,points=(day.points||{}) as Record<string,unknown>,entry=points[String(person.id)];
+    const point=entry&&typeof entry==='object'?entry as Record<string,unknown>:null;if(!point)continue;
+    const absence=point.absented===true||point.absented===1||point.absented==='1'||absenceMarker(point.point);
+    if(!absence&&(point.point===null||point.point===''||point.point===undefined))continue;
+    const value=absence?null:typeof point.point==='number'||typeof point.point==='string'?Number(String(point.point).replace(',','.')):NaN;
+    if(value!==null&&(!Number.isFinite(value)||value<0||value>100))continue;
+    grades.push({value,...(absence?{absence:true as const}:{}),date:dateValue(day.date??day.fullDate??day.label),kind:typeof point.type_label==='string'?point.type_label:typeof day.type_label==='string'?day.type_label:typeof point.type==='string'?point.type:typeof day.type==='string'?day.type:undefined,sourceId:String(day.id??day.date??day.label??grades.length)});
   }
-  const subject=parseGradeJSON([{name,teacher,scale:payload.typeOfEvaluation==='percent'?100:5,grades}]).subjects[0];return {...subject,id,grades:subject.grades.map((g,i)=>({...g,id:id+':'+grades[i].sourceId,kind:grades[i].kind}))};
+  try{
+    const subject=parseGradeJSON([{name,teacher,scale:payload.typeOfEvaluation==='percent'?100:payload.typeOfEvaluation==='five'?5:undefined,grades}]).subjects[0];
+    return {...subject,id,grades:subject.grades.map((g,i)=>({...g,id:id+':'+grades[i].sourceId,kind:grades[i].kind}))};
+  }catch(error){throw syncFailure(error,'journal-parse');}
 }
 export function parseJournalTeacher(info:Record<string,unknown>):string{
   const entry=Object.entries(info).find(([key,value])=>/teacher|преподавател/i.test(key)||value&&typeof value==='object'&&/teacher|преподавател|оқытушы/i.test(String((value as Record<string,unknown>).label||'')));
@@ -130,10 +157,10 @@ async function syncJournals(client:SmartNationClient):Promise<GradeSnapshot>{
     if(!found||!parsed.next)break;address=parsed.next;
   }
   if(!journals.size)throw new SyncError('Журналы не найдены. Проверьте кабинет или используйте быстрый импорт.');
-  const subjects:GradeSubject[]=[],warnings:string[]=[];
+  const subjects:GradeSubject[]=[],warnings:string[]=[],unavailableSubjectIds:string[]=[];
   // Small parallel batches keep the UI responsive without flooding the college portal.
   const list=[...journals.values()];
-  for(let offset=0;offset<list.length;offset+=3){const batch=await Promise.all(list.slice(offset,offset+3).map(async journal=>{
+  for(let offset=0;offset<list.length;offset+=3){const batch=await Promise.allSettled(list.slice(offset,offset+3).map(async journal=>{
     const page=await client.request(journal.url);const {config,journalId}=apiConfiguration(page.html);
     if(!config?.mainTable||!config.students){try{return parseGradeText(load(page.html)('body').text()).subjects[0];}catch{throw new SyncError('Вёрстка SmartNation изменилась. Доступен быстрый импорт.');}}
     const url=config.mainTable.replace(/:journalId|\{journalId\}/g,journalId);
@@ -145,23 +172,35 @@ async function syncJournals(client:SmartNationClient):Promise<GradeSnapshot>{
     let activePayload=payload;
     if(!payload.isModule&&payload.currentSemester){main.searchParams.set('semester',String(payload.currentSemester));activePayload=await client.data(main.href);}
     return parseJournalPayload(activePayload,students,journal.name||`Журнал ${journalId}`,journal.teacher||(info?parseJournalTeacher(info):''),`smartnation-${journalId}`);
-  }));subjects.push(...batch);}
-  if(!subjects.some(s=>s.grades.length))warnings.push('Журналы найдены, но числовых оценок пока нет.');
-  return {version:1,source:'smartnation',profile:client.profile,syncedAt:new Date().toISOString(),subjects,warnings};
+  }));
+    for(let i=0;i<batch.length;i++){
+      const result=batch[i];if(result.status==='fulfilled')subjects.push(result.value);
+      else {const error=syncFailure(result.reason,'journal-read');if(error.status===401||error.status===403)throw error;
+        console.warn('smartnation-journal-failed',JSON.stringify({code:error.code,status:error.status,stage:error.stage}));
+        const missingId=new URL(list[offset+i].url).pathname.match(/\/journals\/(\d+)/)?.[1];if(missingId)unavailableSubjectIds.push('smartnation-'+missingId);
+        warnings.push(`Не удалось обновить предмет «${list[offset+i].name||'Журнал'}». Повторите синхронизацию.`);
+      }
+    }
+  }
+  if(!subjects.length)throw new SyncError('SmartNation не вернул журналы с оценками. Повторите загрузку журналов.',502,'all-journals-failed');
+  if(!subjects.some(s=>s.grades.length))warnings.push('Журналы найдены, но оценок и пропусков пока нет.');
+  return {version:1,source:'smartnation',profile:client.profile,syncedAt:new Date().toISOString(),subjects,warnings,...(unavailableSubjectIds.length?{unavailableSubjectIds}:{})};
 }
 export async function loginAndSync(login:string,password:string,remember:boolean,fetcher:typeof fetch=fetch){
   const session:UpstreamSession={cookies:{},expires:Date.now()+(remember?7*86400000:8*3600000),remember};secret();
-  const client=new SmartNationClient(session,fetcher),page=await client.request(SMARTNATION_LOGIN);
+  const client=new SmartNationClient(session,fetcher);let stage='login-form';
+  try{const page=await client.request(SMARTNATION_LOGIN);
   const token=page.html.match(/"csrfToken"\s*:\s*"([^"]+)"/)?.[1]||load(page.html)('meta[name="csrf-token"]').attr('content');
   if(!token)throw new SyncError('SmartNation не предоставил форму входа. Используйте быстрый импорт.');session.csrf=token;
   const type=/^\d{12}$/.test(login)?'iin':login.includes('@')?'email':'login';
   const body=new URLSearchParams({password,type,[type]:login});
-  const result=await client.request(SMARTNATION_LOGIN,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded',Accept:'application/json','X-Requested-With':'XMLHttpRequest','X-RegionId':'12'},body});
+  stage='login-submit';const result=await client.request(SMARTNATION_LOGIN,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded',Accept:'application/json','X-Requested-With':'XMLHttpRequest','X-RegionId':'12'},body});
   if(result.status>=400||result.json?.error||result.json?.errors)throw new SyncError('Не удалось войти. Проверьте логин и пароль; при дополнительной проверке используйте быстрый импорт.',401);
   // Follow only a verified same-portal redirect from the login response.
-  if(typeof result.json?.redirect==='string'){const landing=await client.request(safeURL(result.json.redirect).href);const home=parseJournalList(landing.html,landing.url).home;if(home)session.journalsURL=home;}
-  try{await client.renewAccessToken();return {snapshot:await syncJournals(client),session};}catch(error){if(error instanceof SyncError&&error.status!==401)error.session=session;throw error;}
+  stage='login-redirect';if(typeof result.json?.redirect==='string'){const landing=await client.request(safeURL(result.json.redirect).href);const home=parseJournalList(landing.html,landing.url).home;if(home)session.journalsURL=home;}
+  stage='token';await client.renewAccessToken();stage='journals';return {snapshot:await syncJournals(client),session};
+  }catch(cause){const error=syncFailure(cause,stage);if(stage!=='login-form'&&stage!=='login-submit'&&error.status!==401)error.session=session;throw error;}
 }
-export async function refreshSmartNationSession(session:UpstreamSession,fetcher:typeof fetch=fetch){const client=new SmartNationClient(session,fetcher);try{let renew=!session.token;if(session.token){try{const payload=JSON.parse(Buffer.from(session.token.split('.')[1],'base64url').toString('utf8'));renew=typeof payload.exp==='number'&&payload.exp*1000<Date.now()+60000;}catch{}}if(renew)await client.renewAccessToken();return {snapshot:await syncJournals(client),session};}catch(error){if(error instanceof SyncError&&error.status!==401)error.session=session;throw error;}}
+export async function refreshSmartNationSession(session:UpstreamSession,fetcher:typeof fetch=fetch){const client=new SmartNationClient(session,fetcher);try{let renew=!session.token;if(session.token){try{const payload=JSON.parse(Buffer.from(session.token.split('.')[1],'base64url').toString('utf8'));renew=typeof payload.exp==='number'&&payload.exp*1000<Date.now()+60000;}catch{}}if(renew)await client.renewAccessToken();return {snapshot:await syncJournals(client),session};}catch(cause){const error=syncFailure(cause,'refresh');if(error.status!==401)error.session=session;throw error;}}
 
 export function refreshSmartNation(request:Request){return refreshSmartNationSession(readSmartNationSession(request));}
